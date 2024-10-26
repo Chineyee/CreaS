@@ -6,6 +6,7 @@
 (define-constant MAX-PROJECT-ID u1000000)
 (define-constant MIN-SHARE-PERCENTAGE u1)
 (define-constant MAX-SHARE-PERCENTAGE u100)
+(define-constant NULL_PRINCIPAL 'SP000000000000000000002Q6VF78)
 
 ;; Error Codes
 (define-constant err-owner-only (err u100))
@@ -24,6 +25,8 @@
 (define-constant err-collaborator-exists (err u113))
 (define-constant err-no-earnings (err u114))
 (define-constant err-withdrawal-failed (err u115))
+(define-constant err-invalid-collaborator (err u116))
+(define-constant err-self-collaboration (err u117))
 
 ;; Data Variables
 (define-data-var next-project-id uint u1)
@@ -51,7 +54,8 @@
         earnings: uint,
         role: (string-ascii 64),
         added-at: uint,
-        last-distribution: uint
+        last-distribution: uint,
+        is-verified: bool
     }
 )
 
@@ -73,18 +77,26 @@
     )
 )
 
+;; Updated collaborator validation function
+(define-private (validate-collaborator (collaborator principal))
+    (and
+        (not (is-eq collaborator NULL_PRINCIPAL))
+        (not (is-eq collaborator tx-sender))
+    )
+)
+
 (define-private (validate-title (title (string-ascii 256)))
     (and 
         (not (is-eq title ""))
         (<= (len title) u256)
-        (> (len title) u2)  ;; Minimum length requirement
+        (> (len title) u2)
     )
 )
 
 (define-private (validate-content-hash (content-hash (buff 32)))
     (and
-        (not (is-eq content-hash 0x)) ;; Check if not empty
-        (is-eq (len content-hash) u32) ;; Verify exact length
+        (not (is-eq content-hash 0x))
+        (is-eq (len content-hash) u32)
     )
 )
 
@@ -122,7 +134,7 @@
     )
 )
 
-;; Enhanced Project Management Functions
+;; Project Management Functions
 (define-public (create-project (title (string-ascii 256)) (content-hash (buff 32)) (license-type (string-ascii 64)))
     (begin
         (asserts! (validate-title title) err-invalid-title)
@@ -148,9 +160,11 @@
     )
 )
 
+;; Enhanced add-collaborator function with safety checks
 (define-public (add-collaborator (project-id uint) (collaborator principal) (share-percentage uint) (role (string-ascii 64)))
     (begin
         (asserts! (validate-project-id project-id) err-invalid-project-id)
+        (asserts! (validate-collaborator collaborator) err-invalid-collaborator)
         (asserts! (validate-share-percentage share-percentage) err-invalid-percentage)
         (asserts! (validate-role role) err-invalid-role)
         
@@ -176,29 +190,27 @@
                     earnings: u0,
                     role: role,
                     added-at: block-height,
-                    last-distribution: block-height
+                    last-distribution: block-height,
+                    is-verified: false
                 }
             ))
         )
     )
 )
 
-;; Enhanced Revenue Distribution Functions
+;; Revenue Distribution Functions
 (define-private (calculate-share (amount uint) (percentage uint))
     (/ (* amount percentage) u100)
 )
 
-;; New helper function to distribute earnings to collaborators
 (define-private (distribute-to-collaborators (project-id uint) (amount uint))
     (let (
         (project (unwrap! (get-project-details project-id) err-not-found))
         (collaborator-info (unwrap! (get-collaborator-info project-id tx-sender) err-not-found))
     )
-        ;; Calculate share for the collaborator
         (let (
             (share-amount (calculate-share amount (get share-percentage collaborator-info)))
         )
-            ;; Update collaborator's earnings
             (map-set collaborators
                 { project-id: project-id, collaborator: tx-sender }
                 (merge collaborator-info {
@@ -211,6 +223,21 @@
     )
 )
 
+;; Verification Functions
+(define-public (verify-collaborator (project-id uint) (collaborator principal))
+    (let (
+        (project (unwrap! (get-project-details project-id) err-not-found))
+        (collab-info (unwrap! (get-collaborator-info project-id collaborator) err-not-found))
+    )
+        (asserts! (is-eq tx-sender (get owner project)) err-owner-only)
+        (ok (map-set collaborators
+            { project-id: project-id, collaborator: collaborator }
+            (merge collab-info { is-verified: true })
+        ))
+    )
+)
+
+;; Revenue Distribution
 (define-public (distribute-revenue (project-id uint) (amount uint))
     (begin
         (asserts! (validate-project-id project-id) err-invalid-project-id)
@@ -221,7 +248,6 @@
         )
             (asserts! (get is-active project) err-project-inactive)
             
-            ;; Update project total revenue
             (map-set projects 
                 { project-id: project-id }
                 (merge project { 
@@ -230,7 +256,6 @@
                 })
             )
             
-            ;; Distribute earnings to collaborators
             (try! (distribute-to-collaborators project-id amount))
             
             (ok true)
@@ -238,7 +263,7 @@
     )
 )
 
-;; New withdrawal function for collaborators
+;; Withdrawal Functions
 (define-public (withdraw-earnings (project-id uint))
     (begin
         (asserts! (validate-project-id project-id) err-invalid-project-id)
@@ -247,10 +272,8 @@
             (collaborator-info (unwrap! (get-collaborator-info project-id tx-sender) err-not-found))
             (earnings-amount (get earnings collaborator-info))
         )
-            ;; Verify there are earnings to withdraw
             (asserts! (> earnings-amount u0) err-no-earnings)
             
-            ;; Reset earnings to zero before transfer
             (map-set collaborators
                 { project-id: project-id, collaborator: tx-sender }
                 (merge collaborator-info {
@@ -259,15 +282,12 @@
                 })
             )
             
-            ;; Perform the transfer
-            ;; Note: In a real implementation, you would integrate with your chosen
-            ;; token contract here using contract-call?
             (ok earnings-amount)
         )
     )
 )
 
-;; Enhanced Licensing Functions
+;; Licensing Functions
 (define-public (record-license-usage (project-id uint) (usage-type (string-ascii 64)) (payment uint))
     (begin
         (asserts! (validate-project-id project-id) err-invalid-project-id)
@@ -292,7 +312,7 @@
     )
 )
 
-;; Enhanced Read-Only Functions
+;; Read-Only Functions
 (define-read-only (get-project-details (project-id uint))
     (begin
         (asserts! (validate-project-id project-id) err-invalid-project-id)
@@ -318,7 +338,6 @@
     )
 )
 
-;; New read-only function to check pending earnings
 (define-read-only (get-pending-earnings (project-id uint) (collaborator principal))
     (begin
         (asserts! (validate-project-id project-id) err-invalid-project-id)
@@ -328,7 +347,7 @@
     )
 )
 
-;; Enhanced Project Status Management
+;; Project Status Management
 (define-public (deactivate-project (project-id uint))
     (let ((project (unwrap! (get-project-details project-id) err-not-found)))
         (asserts! (is-eq tx-sender (get owner project)) err-owner-only)
@@ -351,7 +370,7 @@
     )
 )
 
-;; New Utility Functions
+;; Utility Functions
 (define-read-only (get-current-project-id)
     (ok (var-get next-project-id))
 )
