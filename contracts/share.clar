@@ -22,6 +22,8 @@
 (define-constant err-invalid-role (err u111))
 (define-constant err-project-inactive (err u112))
 (define-constant err-collaborator-exists (err u113))
+(define-constant err-no-earnings (err u114))
+(define-constant err-withdrawal-failed (err u115))
 
 ;; Data Variables
 (define-data-var next-project-id uint u1)
@@ -85,7 +87,6 @@
         (is-eq (len content-hash) u32) ;; Verify exact length
     )
 )
-
 
 (define-private (validate-license-type (license-type (string-ascii 64)))
     (and 
@@ -187,6 +188,29 @@
     (/ (* amount percentage) u100)
 )
 
+;; New helper function to distribute earnings to collaborators
+(define-private (distribute-to-collaborators (project-id uint) (amount uint))
+    (let (
+        (project (unwrap! (get-project-details project-id) err-not-found))
+        (collaborator-info (unwrap! (get-collaborator-info project-id tx-sender) err-not-found))
+    )
+        ;; Calculate share for the collaborator
+        (let (
+            (share-amount (calculate-share amount (get share-percentage collaborator-info)))
+        )
+            ;; Update collaborator's earnings
+            (map-set collaborators
+                { project-id: project-id, collaborator: tx-sender }
+                (merge collaborator-info {
+                    earnings: (+ (get earnings collaborator-info) share-amount),
+                    last-distribution: block-height
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
 (define-public (distribute-revenue (project-id uint) (amount uint))
     (begin
         (asserts! (validate-project-id project-id) err-invalid-project-id)
@@ -197,6 +221,7 @@
         )
             (asserts! (get is-active project) err-project-inactive)
             
+            ;; Update project total revenue
             (map-set projects 
                 { project-id: project-id }
                 (merge project { 
@@ -205,7 +230,39 @@
                 })
             )
             
+            ;; Distribute earnings to collaborators
+            (try! (distribute-to-collaborators project-id amount))
+            
             (ok true)
+        )
+    )
+)
+
+;; New withdrawal function for collaborators
+(define-public (withdraw-earnings (project-id uint))
+    (begin
+        (asserts! (validate-project-id project-id) err-invalid-project-id)
+        
+        (let (
+            (collaborator-info (unwrap! (get-collaborator-info project-id tx-sender) err-not-found))
+            (earnings-amount (get earnings collaborator-info))
+        )
+            ;; Verify there are earnings to withdraw
+            (asserts! (> earnings-amount u0) err-no-earnings)
+            
+            ;; Reset earnings to zero before transfer
+            (map-set collaborators
+                { project-id: project-id, collaborator: tx-sender }
+                (merge collaborator-info {
+                    earnings: u0,
+                    last-distribution: block-height
+                })
+            )
+            
+            ;; Perform the transfer
+            ;; Note: In a real implementation, you would integrate with your chosen
+            ;; token contract here using contract-call?
+            (ok earnings-amount)
         )
     )
 )
@@ -258,6 +315,16 @@
         (ok (unwrap! (map-get? licensing-history 
             { project-id: project-id, licensee: licensee }
         ) err-not-found))
+    )
+)
+
+;; New read-only function to check pending earnings
+(define-read-only (get-pending-earnings (project-id uint) (collaborator principal))
+    (begin
+        (asserts! (validate-project-id project-id) err-invalid-project-id)
+        (let ((collaborator-info (unwrap! (get-collaborator-info project-id collaborator) err-not-found)))
+            (ok (get earnings collaborator-info))
+        )
     )
 )
 
